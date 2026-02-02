@@ -1,215 +1,426 @@
-import express from 'express';
+import express from "express";
+import { Agent } from "undici";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { z } from 'zod';
-import Fuse from 'fuse.js';
-import { CallToolRequestSchema, ListToolsRequestSchema, ReadResourceRequestSchema, ListResourcesRequestSchema, SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { SPECIES_DATA } from './data/species.js';
-import { RESOURCES } from './data/resources.js';
-import { timestamp, formatSpeciesText } from './utils/utils.js';
+import { CallToolRequestSchema, ListToolsRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
+import pdfParse from "pdf-parse";
 const app = express();
 app.use(express.json());
-// Create the MCP server once (reused across requests)
 const server = new Server({
-    name: "biological-species-mcp-server",
+    name: "imanage-mcp-server",
     version: "1.0.0",
 }, {
     capabilities: {
-        resources: { subscribe: true },
         tools: {},
     },
 });
-// Tool input schemas
-const SearchSpeciesDataSchema = z.object({
-    searchTerms: z.string().describe("keywords to search for facts about species")
+const SearchSchema = z.object({
+    query: z.string().describe("Search query text"),
+    maxResults: z.number().int().min(1).max(20).optional(),
 });
-const ListSpeciesSchema = z.object({});
-// Configure Fuse.js for fuzzy searching
-const fuseOptions = {
-    keys: ['name', 'description'],
-    threshold: 0.4, // 0 = exact match, 1 = match anything
-    includeScore: true,
-    minMatchCharLength: 2
-};
-const fuse = new Fuse(RESOURCES, fuseOptions);
-// Handler: List available tools
+const FetchSchema = z.object({
+    id: z.string().describe("iManage document URI or URL"),
+    timeoutSeconds: z.number().positive().optional(),
+    followRedirects: z.boolean().optional(),
+    headers: z.record(z.string()).optional(),
+});
+const IMANAGE_SERVER = process.env.IMANAGE_SERVER ?? "fireman.cloudimanage.com";
+const IMANAGE_USERNAME = process.env.IMANAGE_USERNAME ?? "CloudAdmin@sandbox.firemanco.com";
+const IMANAGE_PASSWORD = process.env.IMANAGE_PASSWORD ?? "pxg@zkm.CVU*der3tbd";
+const IMANAGE_CLIENT_ID = process.env.IMANAGE_CLIENT_ID ?? "d8e2d5ef-0c1f-4475-af2c-ad4e2d5bc784";
+const IMANAGE_CLIENT_SECRET = process.env.IMANAGE_CLIENT_SECRET ?? "f8fa1e6-358d-4d11-9bae-8711c2a70a47";
+const IMANAGE_LIBRARY_ID = process.env.IMANAGE_LIBRARY_ID ?? "ACTIVE_2";
+const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT ?? "30");
+const MAX_DOC_BYTES = Number(process.env.MAX_DOC_BYTES ?? String(10 * 1024 * 1024));
+const MAX_PAGES = Number(process.env.MAX_PAGES ?? "20");
+const SKIP_LARGE_FILES = (process.env.SKIP_LARGE_FILES ?? "1") === "1";
+const CHUNK_SIZE = Number(process.env.CHUNK_SIZE ?? "1200");
+const CHUNK_OVERLAP = Number(process.env.CHUNK_OVERLAP ?? "100");
+const insecureAgent = new Agent({
+    connect: {
+        rejectUnauthorized: false,
+    },
+});
+const DEFAULT_TIMEOUT_MS = REQUEST_TIMEOUT * 1000;
+function splitText(text, chunkSize, overlap) {
+    if (!text) {
+        return "";
+    }
+    const chunks = [];
+    let start = 0;
+    while (start < text.length) {
+        const end = Math.min(text.length, start + chunkSize);
+        chunks.push(text.slice(start, end));
+        start = Math.max(start + chunkSize - overlap, start + 1);
+        if (chunks.join("").length >= MAX_DOC_BYTES) {
+            break;
+        }
+    }
+    return chunks.join("\n");
+}
+async function fetchWithTimeout(url, options, timeoutMs) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, {
+            ...options,
+            signal: controller.signal,
+            dispatcher: insecureAgent,
+        });
+    }
+    finally {
+        clearTimeout(timeout);
+    }
+}
+async function imanageAuthToken() {
+    const url = `https://${IMANAGE_SERVER}/auth/oauth2/token`;
+    const body = new URLSearchParams({
+        username: IMANAGE_USERNAME,
+        password: IMANAGE_PASSWORD,
+        grant_type: "password",
+        client_id: IMANAGE_CLIENT_ID,
+        client_secret: IMANAGE_CLIENT_SECRET,
+        scope: "user",
+    });
+    const response = await fetchWithTimeout(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body,
+    }, DEFAULT_TIMEOUT_MS);
+    if (!response.ok) {
+        return null;
+    }
+    const data = (await response.json());
+    return data.access_token ?? null;
+}
+async function imanageCustomerId(token) {
+    const url = `https://${IMANAGE_SERVER}/api`;
+    console.log("Fetching iManage customer ID from", url);
+    const response = await fetchWithTimeout(url, {
+        method: "GET",
+        headers: {
+            "X-Auth-Token": token,
+        },
+    }, DEFAULT_TIMEOUT_MS);
+    if (!response.ok) {
+        return null;
+    }
+    const data = (await response.json());
+    return data.data?.user?.customer_id ?? null;
+}
+function imanageDocUri(customerId, libraryId, docId) {
+    return `imanage://${customerId}/${libraryId}/${docId}`;
+}
+function parseIManageUri(uri) {
+    if (!uri.startsWith("imanage://")) {
+        throw new Error("Not an iManage URI");
+    }
+    const rest = uri.slice("imanage://".length);
+    const parts = rest.split("/", 3);
+    if (parts.length !== 3) {
+        throw new Error("Bad iManage URI");
+    }
+    const [customerId, libraryId, docId] = parts;
+    return { customerId, libraryId, docId };
+}
+async function imanageSearch(query, maxResults) {
+    console.log("Searching iManage for query:", query);
+    const token = await imanageAuthToken();
+    if (!token) {
+        return [];
+    }
+    const customerId = await imanageCustomerId(token);
+    if (!customerId) {
+        return [];
+    }
+    const url = `https://${IMANAGE_SERVER}/work/api/v2/customers/${customerId}/libraries/${IMANAGE_LIBRARY_ID}/documents/search`;
+    const payload = {
+        profile_fields: { document: ["id", "name", "file_edit_date", "iwl"] },
+        filters: { body: query, type: "ACROBAT" },
+        limit: maxResults,
+    };
+    const response = await fetchWithTimeout(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-Auth-Token": token,
+        },
+        body: JSON.stringify(payload),
+    }, DEFAULT_TIMEOUT_MS);
+    if (!response.ok) {
+        return [];
+    }
+    const data = (await response.json());
+    const results = [];
+    for (const entry of (data.data ?? []).slice(0, maxResults)) {
+        const docId = String(entry.id ?? "");
+        const title = String(entry.name ?? docId);
+        const urlValue = String(entry.iwl ?? "");
+        if (!docId) {
+            continue;
+        }
+        results.push({
+            id: imanageDocUri(customerId, IMANAGE_LIBRARY_ID, docId),
+            title,
+            url: urlValue,
+        });
+    }
+    return results;
+}
+async function imanageHistoryViews(token, customerId, libraryId, docId, granularity = "weekly") {
+    const url = `https://${IMANAGE_SERVER}/work/api/v2/customers/${customerId}/libraries/${libraryId}/documents/${docId}/history/plot-points/${granularity}`;
+    const response = await fetchWithTimeout(url, {
+        method: "GET",
+        headers: {
+            "X-Auth-Token": token,
+            Accept: "application/json",
+        },
+    }, DEFAULT_TIMEOUT_MS);
+    if (response.status === 204 || response.status === 404) {
+        return null;
+    }
+    if (!response.ok) {
+        return null;
+    }
+    const payload = (await response.json());
+    const points = Array.isArray(payload)
+        ? payload
+        : payload.data;
+    if (!Array.isArray(points)) {
+        return null;
+    }
+    let total = 0;
+    for (const point of points) {
+        if (typeof point === "object" && point && "y" in point) {
+            const value = Number(point.y);
+            if (!Number.isNaN(value)) {
+                total += value;
+            }
+        }
+    }
+    return total;
+}
+async function readStreamToBuffer(stream, maxBytes) {
+    const reader = stream.getReader();
+    const chunks = [];
+    let total = 0;
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done || !value) {
+            break;
+        }
+        chunks.push(value);
+        total += value.length;
+        if (total > maxBytes) {
+            break;
+        }
+    }
+    return { buffer: Buffer.concat(chunks), bytes: total };
+}
+async function imanageDownloadPdf(token, customerId, libraryId, docId) {
+    const url = `https://${IMANAGE_SERVER}/work/api/v2/customers/${customerId}/libraries/${libraryId}/documents/${docId}/download`;
+    const headers = { "X-Auth-Token": token };
+    if (SKIP_LARGE_FILES) {
+        const headResponse = await fetchWithTimeout(url, {
+            method: "HEAD",
+            headers,
+        }, DEFAULT_TIMEOUT_MS);
+        if (headResponse.ok) {
+            const sizeValue = Number(headResponse.headers.get("Content-Length") ?? "0");
+            if (sizeValue && sizeValue > MAX_DOC_BYTES) {
+                return {
+                    bytes: Buffer.from(""),
+                    metadata: {
+                        skipped: true,
+                        reason: `file too large (${sizeValue} > ${MAX_DOC_BYTES} bytes)`,
+                    },
+                };
+            }
+        }
+    }
+    const response = await fetchWithTimeout(url, {
+        method: "GET",
+        headers,
+    }, DEFAULT_TIMEOUT_MS);
+    if (!response.ok || !response.body) {
+        return {
+            bytes: Buffer.from(""),
+            metadata: { error: `download failed: ${response.status}` },
+        };
+    }
+    const { buffer, bytes } = await readStreamToBuffer(response.body, MAX_DOC_BYTES);
+    return {
+        bytes: buffer,
+        metadata: { bytes },
+    };
+}
+async function extractPdfText(pdfBytes) {
+    if (!pdfBytes.length) {
+        return "";
+    }
+    const parsed = await pdfParse(pdfBytes, { max: MAX_PAGES });
+    let text = parsed.text?.trim() ?? "";
+    if (text.length > MAX_DOC_BYTES / 4) {
+        text = splitText(text, CHUNK_SIZE, CHUNK_OVERLAP);
+    }
+    return `[PDF parsed via pdf-parse]\n${text}`;
+}
+async function resolveIManageDocument(imanageUri) {
+    const { customerId, libraryId, docId } = parseIManageUri(imanageUri);
+    const token = await imanageAuthToken();
+    if (!token) {
+        throw new Error("iManage auth failed (check credentials & scopes)");
+    }
+    const download = await imanageDownloadPdf(token, customerId, libraryId, docId);
+    const text = await extractPdfText(download.bytes);
+    const profileUrl = `https://${IMANAGE_SERVER}/work/#/document/${customerId}/${libraryId}/${docId}`;
+    const history = await imanageHistoryViews(token, customerId, libraryId, docId, "weekly");
+    const metadata = {
+        source: "imanage",
+        customer_id: customerId,
+        library_id: libraryId,
+        doc_id: docId,
+        ...download.metadata,
+    };
+    if (history !== null) {
+        metadata.Views = history;
+    }
+    const skipped = download.metadata.skipped === true;
+    const reason = typeof download.metadata.reason === "string" ? download.metadata.reason : "";
+    return {
+        id: imanageUri,
+        title: `iManage Document ${docId}`,
+        text: text || (skipped ? `[Skipped: ${reason}]` : ""),
+        url: profileUrl,
+        metadata,
+    };
+}
+async function fetchUrlContent(url, timeoutSeconds, followRedirects, headers) {
+    const response = await fetchWithTimeout(url, {
+        method: "GET",
+        headers: {
+            "User-Agent": "mcp-imanage/1.0",
+            ...(headers ?? {}),
+        },
+        redirect: followRedirects ? "follow" : "manual",
+    }, timeoutSeconds * 1000);
+    if (!response.ok) {
+        throw new Error(`URL fetch failed: ${response.status}`);
+    }
+    const contentType = response.headers.get("Content-Type") ?? "";
+    const text = await response.text();
+    return {
+        id: url,
+        title: url,
+        text: contentType.includes("text/html") ? text.replace(/<[^>]+>/g, " ") : text,
+        url,
+        metadata: {
+            source: "url",
+            content_type: contentType,
+        },
+    };
+}
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
         tools: [
             {
-                name: "searchSpeciesData",
-                description: "Search for species resources by title keywords. Returns up to 5 matching resource links (text, images, data packages).",
-                inputSchema: zodToJsonSchema(SearchSpeciesDataSchema),
+                name: "search",
+                description: "Search iManage documents by query.",
+                inputSchema: zodToJsonSchema(SearchSchema),
             },
             {
-                name: "listSpecies",
-                description: "Get a list of all available species names in the database.",
-                inputSchema: zodToJsonSchema(ListSpeciesSchema),
+                name: "fetch",
+                description: "Fetch an iManage document by URI or fetch URL content.",
+                inputSchema: zodToJsonSchema(FetchSchema),
             },
         ],
     };
 });
-// Handler: Call tool
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    if (name === "searchSpeciesData") {
-        const validatedArgs = SearchSpeciesDataSchema.parse(args);
-        const { searchTerms } = validatedArgs;
-        console.log(`${timestamp()} 🔍 Client called tool: searchSpeciesData with terms '${searchTerms}'`);
-        // Use Fuse.js for fuzzy search
-        const searchResults = fuse.search(searchTerms);
-        if (searchResults.length === 0) {
-            console.log(`${timestamp()} ⚠️  No resources found for client search: "${searchTerms}"`);
+    console.log(`Tool call: ${name} with args:`, args);
+    if (name === "search") {
+        const { query, maxResults } = SearchSchema.parse(args);
+        if (!query.trim()) {
             return {
                 content: [
                     {
                         type: "text",
-                        text: `No resources found matching: "${searchTerms}". Try keywords like 'butterfly', 'panda', 'photo', 'overview', or 'data'.`,
+                        text: JSON.stringify({ results: [] }),
                     },
                 ],
             };
         }
-        // Return top 5 results
-        const results = searchResults.slice(0, 5).map(result => result.item);
-        console.log(`${timestamp()} ✅ Returning ${results.length} matching resources to client`);
-        const content = [
-            {
-                type: "text",
-                text: `Found ${results.length} resource(s) matching "${searchTerms}":\n\n${results.map((r, i) => `${i + 1}. ${r.name}`).join('\n')}`,
-            },
-        ];
-        // Add resource references
-        results.forEach(resource => {
-            content.push({
-                type: "resource_link",
-                uri: resource.uri,
-                name: resource.name,
-                description: resource.description,
-                mimeType: resource.mimeType,
-                annotations: {
-                    audience: ["assistant"],
-                    priority: 0.8
-                }
-            });
-        });
-        return { content };
-    }
-    if (name === "listSpecies") {
-        console.log(`${timestamp()} 📋 Client called tool: listSpecies`);
-        // Get only species names
-        const speciesNames = SPECIES_DATA.map(species => species.commonName);
-        console.log(`${timestamp()} ✅ Returning ${speciesNames.length} species names to client`);
+        const results = await imanageSearch(query, maxResults ?? 5);
         return {
             content: [
                 {
                     type: "text",
-                    text: JSON.stringify(speciesNames, null, 2),
+                    text: JSON.stringify({ results }),
+                },
+            ],
+        };
+    }
+    if (name === "fetch") {
+        const { id, timeoutSeconds, followRedirects, headers } = FetchSchema.parse(args);
+        const timeout = timeoutSeconds ?? 15;
+        const redirects = followRedirects ?? true;
+        let isUrl = false;
+        try {
+            const url = new URL(id);
+            isUrl = url.protocol === "http:" || url.protocol === "https:";
+        }
+        catch {
+            isUrl = false;
+        }
+        const doc = isUrl
+            ? await fetchUrlContent(id, timeout, redirects, headers)
+            : await resolveIManageDocument(id);
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify(doc),
                 },
             ],
         };
     }
     throw new Error(`Unknown tool: ${name}`);
 });
-// Handler: List resources
-server.setRequestHandler(ListResourcesRequestSchema, async () => {
-    console.log(`${timestamp()} 📋 Client requesting list of all ${RESOURCES.length} resources`);
-    return {
-        resources: RESOURCES.map(r => ({
-            uri: r.uri,
-            name: r.name,
-            description: r.description,
-            mimeType: r.mimeType,
-        }))
-    };
-});
-// Handler: Read resource
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-    const uri = request.params.uri;
-    console.log(`${timestamp()} 📖 Client reading resource: ${uri}`);
-    // Find the resource
-    const resource = RESOURCES.find(r => r.uri === uri);
-    if (!resource) {
-        throw new Error(`Unknown resource: ${uri}`);
-    }
-    const species = SPECIES_DATA.find(s => s.id === resource.speciesId);
-    if (!species) {
-        throw new Error(`Species not found for resource: ${uri}`);
-    }
-    console.log(`${timestamp()} 📄 Client requested: ${species.commonName} - ${resource.resourceType}`);
-    // Return content based on resource type
-    if (resource.resourceType === 'text') {
-        const content = formatSpeciesText(species);
-        console.log(`${timestamp()} 📝 Returning text content to client (${content.length} characters)`);
-        return {
-            contents: [
-                {
-                    uri,
-                    mimeType: "text/plain",
-                    text: content,
-                },
-            ],
-        };
-    }
-    if (resource.resourceType === 'image') {
-        console.log(`${timestamp()} 🖼️  Returning image to client for ${species.commonName}`);
-        return {
-            contents: [
-                {
-                    uri,
-                    mimeType: "image/png",
-                    blob: species.image,
-                },
-            ],
-        };
-    }
-    throw new Error(`Unknown resource type: ${resource.resourceType}`);
-});
-// Handler: Subscribe to resource updates
-server.setRequestHandler(SubscribeRequestSchema, async (request) => {
-    const { uri } = request.params;
-    console.log(`${timestamp()} 🔔 Client subscribed to: ${uri}`);
-    return {};
-});
-// Handler: Unsubscribe from resource updates
-server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
-    const { uri } = request.params;
-    console.log(`${timestamp()} 🔕 Client unsubscribed from: ${uri}`);
-    return {};
-});
-// Handle MCP requests (stateless mode)
-app.post('/mcp', async (req, res) => {
+app.post("/mcp", async (req, res) => {
     try {
-        // Create new transport for each request to prevent request ID collisions
         const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: undefined,
-            enableJsonResponse: true
+            enableJsonResponse: true,
         });
-        res.on('close', () => {
+        res.on("close", () => {
             transport.close();
         });
         await server.connect(transport);
         await transport.handleRequest(req, res, req.body);
     }
     catch (error) {
-        console.error(`${timestamp()} Error handling MCP request:`, error);
+        console.error("Error handling MCP request:", error);
         if (!res.headersSent) {
             res.status(500).json({
-                jsonrpc: '2.0',
+                jsonrpc: "2.0",
                 error: {
                     code: -32603,
-                    message: 'Internal server error'
+                    message: "Internal server error",
                 },
-                id: null
+                id: null,
             });
         }
     }
 });
-const PORT = parseInt(process.env.PORT || '3000');
+const PORT = Number(process.env.PORT ?? "3000");
 app.listen(PORT, () => {
-    console.log(`${timestamp()} 🚀 Species MCP Server running on http://localhost:${PORT}/mcp`);
-    console.log(`${timestamp()} 📚 Loaded ${SPECIES_DATA.length} species and ${RESOURCES.length} resources`);
-}).on('error', error => {
-    console.error(`${timestamp()} Server error:`, error);
+    console.log(`🚀 iManage MCP Server running on http://localhost:${PORT}/mcp`);
+}).on("error", (error) => {
+    console.error("Server error:", error);
     process.exit(1);
 });
