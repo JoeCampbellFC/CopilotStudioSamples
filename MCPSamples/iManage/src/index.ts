@@ -37,15 +37,11 @@ const FetchSchema = z.object({
   headers: z.record(z.string()).optional(),
 });
 
-
-
-
-
 const IMANAGE_SERVER = process.env.IMANAGE_SERVER ?? "fireman.cloudimanage.com";
-const IMANAGE_USERNAME = process.env.IMANAGE_USERNAME ?? "CloudAdmin@sandbox.firemanco.com";
-const IMANAGE_PASSWORD = process.env.IMANAGE_PASSWORD ?? "pxg@zkm.CVU*der3tbd";
-const IMANAGE_CLIENT_ID = process.env.IMANAGE_CLIENT_ID ?? "d8e2d5ef-0c1f-4475-af2c-ad4e2d5bc784";
-const IMANAGE_CLIENT_SECRET = process.env.IMANAGE_CLIENT_SECRET ?? "f8fa1e6-358d-4d11-9bae-8711c2a70a47";
+const IMANAGE_USERNAME = process.env.IMANAGE_USERNAME ?? "";
+const IMANAGE_PASSWORD = process.env.IMANAGE_PASSWORD ?? "";
+const IMANAGE_CLIENT_ID = process.env.IMANAGE_CLIENT_ID ?? "";
+const IMANAGE_CLIENT_SECRET = process.env.IMANAGE_CLIENT_SECRET ?? "";
 const IMANAGE_LIBRARY_ID = process.env.IMANAGE_LIBRARY_ID ?? "ACTIVE_2";
 
 const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT ?? "30");
@@ -455,10 +451,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  console.log(`Tool call: ${name} with args:`, args);
-  
+
   if (name === "search") {
     const { query, maxResults } = SearchSchema.parse(args);
+    console.debug(`🔎 [debug] search tool called`, { query, maxResults });
     if (!query.trim()) {
       return {
         content: [
@@ -483,6 +479,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "fetch") {
     const { id, timeoutSeconds, followRedirects, headers } = FetchSchema.parse(args);
+    console.debug(`📥 [debug] fetch tool called`, { id, timeoutSeconds, followRedirects });
     const timeout = timeoutSeconds ?? 15;
     const redirects = followRedirects ?? true;
 
