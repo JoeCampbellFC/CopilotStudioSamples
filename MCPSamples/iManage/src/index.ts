@@ -458,19 +458,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ results: [] }),
+            text: `Found 0 resource(s) matching "${query}":`,
           },
         ],
       };
     }
 
     const results = await imanageSearch(query, maxResults ?? 5);
+    const summaryLines = results.map((result, index) => `${index + 1}. ${result.title}`);
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify({ results }),
+          text: `Found ${results.length} resource(s) matching "${query}":\n\n${summaryLines.join("\n")}`,
         },
+        ...results.map((result) => ({
+          type: "resource_link",
+          name: result.title,
+          uri: result.id,
+          description: result.url || "iManage document",
+          mimeType: "application/pdf",
+          annotations: {
+            audience: ["assistant"],
+            priority: 0.8,
+          },
+          metadata: {
+            id: result.id,
+            url: result.url,
+          },
+        })),
       ],
     };
   }
@@ -497,7 +513,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [
         {
           type: "text",
-          text: JSON.stringify(doc),
+          text: doc.text,
+          metadata: {
+            id: doc.id,
+            title: doc.title,
+            url: doc.url,
+            ...doc.metadata,
+          },
         },
       ],
     };
@@ -534,7 +556,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
   }
 });
 
-const PORT = Number(process.env.PORT ?? "3001s");
+const PORT = Number(process.env.PORT ?? "3000");
 app.listen(PORT, () => {
   console.log(`🚀 iManage MCP Server running on http://localhost:${PORT}/mcp`);
 }).on("error", (error) => {
