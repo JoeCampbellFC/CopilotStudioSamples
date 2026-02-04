@@ -536,7 +536,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
   }
 });
 
-const PORT = Number(process.env.PORT ?? "3000");
+const PORT = Number(process.env.PORT ?? "3001s");
 app.listen(PORT, () => {
   console.log(`🚀 iManage MCP Server running on http://localhost:${PORT}/mcp`);
 }).on("error", (error) => {
