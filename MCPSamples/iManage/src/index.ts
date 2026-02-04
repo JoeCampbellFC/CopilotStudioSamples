@@ -38,10 +38,10 @@ const FetchSchema = z.object({
 });
 
 const IMANAGE_SERVER = process.env.IMANAGE_SERVER ?? "fireman.cloudimanage.com";
-const IMANAGE_USERNAME = process.env.IMANAGE_USERNAME ?? "";
-const IMANAGE_PASSWORD = process.env.IMANAGE_PASSWORD ?? "";
-const IMANAGE_CLIENT_ID = process.env.IMANAGE_CLIENT_ID ?? "";
-const IMANAGE_CLIENT_SECRET = process.env.IMANAGE_CLIENT_SECRET ?? "";
+const IMANAGE_USERNAME = process.env.IMANAGE_USERNAME ?? "CloudAdmin@sandbox.firemanco.com";
+const IMANAGE_PASSWORD = process.env.IMANAGE_PASSWORD ?? "pxg@zkm.CVU*der3tbd";
+const IMANAGE_CLIENT_ID = process.env.IMANAGE_CLIENT_ID ?? "d8e2d5ef-0c1f-4475-af2c-ad4e2d5bc784";
+const IMANAGE_CLIENT_SECRET = process.env.IMANAGE_CLIENT_SECRET ?? "3f8fa1e6-358d-4d11-9bae-8711c2a70a47";
 const IMANAGE_LIBRARY_ID = process.env.IMANAGE_LIBRARY_ID ?? "ACTIVE_2";
 
 const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT ?? "30");
@@ -100,6 +100,8 @@ async function imanageAuthToken(): Promise<string | null> {
     client_secret: IMANAGE_CLIENT_SECRET,
     scope: "user",
   });
+
+  
 
   const response = await fetchWithTimeout(
     url,
@@ -463,28 +465,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     const results = await imanageSearch(query, maxResults ?? 5);
-    const summaryLines = results.map((result, index) => `${index + 1}. ${result.title}`);
     return {
       content: [
         {
           type: "text",
-          text: `Found ${results.length} resource(s) matching "${query}":\n\n${summaryLines.join("\n")}`,
+          text: JSON.stringify({ results }),
         },
-        ...results.map((result) => ({
-          type: "resource_link",
-          name: result.title,
-          uri: result.id,
-          description: result.url || "iManage document",
-          mimeType: "application/pdf",
-          annotations: {
-            audience: ["assistant"],
-            priority: 0.8,
-          },
-          metadata: {
-            id: result.id,
-            url: result.url,
-          },
-        })),
       ],
     };
   }
