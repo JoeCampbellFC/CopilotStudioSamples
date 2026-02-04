@@ -101,8 +101,6 @@ async function imanageAuthToken(): Promise<string | null> {
     scope: "user",
   });
 
-  
-
   const response = await fetchWithTimeout(
     url,
     {
@@ -476,7 +474,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           type: "resource_link",
           name: result.title,
           uri: result.id,
-          description: result.url || "iManage document",
+          content: result.url || "",
           mimeType: "application/pdf",
           annotations: {
             audience: ["assistant"],
