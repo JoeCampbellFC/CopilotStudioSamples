@@ -2,7 +2,6 @@ import express, { Request, Response } from 'express';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from 'zod';
-import Fuse from 'fuse.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -12,17 +11,41 @@ import {
   UnsubscribeRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { SPECIES_DATA } from './data/species.js';
-import { RESOURCES } from './data/resources.js';
-import { timestamp, formatSpeciesText } from './utils/utils.js';
+import { getPool, sql } from './utils/db.js';
+import { timestamp } from './utils/utils.js';
 
 const app = express();
 app.use(express.json());
 
+const MATTER_URI_PREFIX = 'matter://';
+
+const buildMatterUri = (clientId: number, id: number) =>
+  `${MATTER_URI_PREFIX}${clientId}/${id}`;
+
+const parseMatterUri = (uri: string) => {
+  if (!uri.startsWith(MATTER_URI_PREFIX)) {
+    return null;
+  }
+
+  const parts = uri.slice(MATTER_URI_PREFIX.length).split('/');
+  if (parts.length !== 2) {
+    return null;
+  }
+
+  const clientId = Number(parts[0]);
+  const id = Number(parts[1]);
+
+  if (Number.isNaN(clientId) || Number.isNaN(id)) {
+    return null;
+  }
+
+  return { clientId, id };
+};
+
 // Create the MCP server once (reused across requests)
 const server = new Server(
   {
-    name: "biological-species-mcp-server",
+    name: "imanage-matter-mcp-server",
     version: "1.0.0",
   },
   {
@@ -34,84 +57,121 @@ const server = new Server(
 );
 
 // Tool input schemas
-const SearchSpeciesDataSchema = z.object({
-  searchTerms: z.string().describe("keywords to search for facts about species")
+const SearchMattersSchema = z.object({
+  searchTerms: z.string().describe("keywords to search for matters by name"),
+  limit: z.number().int().min(1).max(25).optional().describe("maximum number of results")
 });
 
-const ListSpeciesSchema = z.object({});
-
-// Configure Fuse.js for fuzzy searching
-const fuseOptions = {
-  keys: ['name', 'description'],
-  threshold: 0.4, // 0 = exact match, 1 = match anything
-  includeScore: true,
-  minMatchCharLength: 2
-};
-
-const fuse = new Fuse(RESOURCES, fuseOptions);
+const GetMatterByIdSchema = z.object({
+  clientId: z.number().int().describe("Matter client ID"),
+  id: z.number().int().describe("Matter ID")
+});
 
 // Handler: List available tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
-        name: "searchSpeciesData",
-        description: "Search for species resources by title keywords. Returns up to 5 matching resource links (text, images, data packages).",
-        inputSchema: zodToJsonSchema(SearchSpeciesDataSchema),
+        name: "searchMatters",
+        description: "Search iManage matters by name. Returns matching matter resource links.",
+        inputSchema: zodToJsonSchema(SearchMattersSchema),
       },
       {
-        name: "listSpecies",
-        description: "Get a list of all available species names in the database.",
-        inputSchema: zodToJsonSchema(ListSpeciesSchema),
+        name: "getMatterById",
+        description: "Retrieve a single matter by client ID and matter ID.",
+        inputSchema: zodToJsonSchema(GetMatterByIdSchema),
       },
     ],
   };
 });
 
+const loadMatterSummary = async (searchTerms: string, limit: number) => {
+  const pool = await getPool();
+  const result = await pool
+    .request()
+    .input('pattern', sql.NVarChar, `%${searchTerms}%`)
+    .input('limit', sql.Int, limit)
+    .query(`
+      SELECT TOP (@limit)
+        ClientId,
+        Id,
+        Name_En_US,
+        Status,
+        OpenDate
+      FROM imanage.Matter
+      WHERE Name_En_US LIKE @pattern
+      ORDER BY Name_En_US ASC
+    `);
+
+  return result.recordset as Array<{
+    ClientId: number;
+    Id: number;
+    Name_En_US: string | null;
+    Status: string | null;
+    OpenDate: Date | null;
+  }>;
+};
+
+const loadMatterById = async (clientId: number, id: number) => {
+  const pool = await getPool();
+  const result = await pool
+    .request()
+    .input('clientId', sql.Int, clientId)
+    .input('id', sql.Int, id)
+    .query(`
+      SELECT *
+      FROM imanage.Matter
+      WHERE ClientId = @clientId
+        AND Id = @id
+    `);
+
+  return result.recordset[0];
+};
+
 // Handler: Call tool
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  if (name === "searchSpeciesData") {
-    const validatedArgs = SearchSpeciesDataSchema.parse(args);
-    const { searchTerms } = validatedArgs;
+  if (name === "searchMatters") {
+    const validatedArgs = SearchMattersSchema.parse(args);
+    const { searchTerms, limit = 5 } = validatedArgs;
 
-    console.log(`${timestamp()} 🔍 Client called tool: searchSpeciesData with terms '${searchTerms}'`);
+    console.log(`${timestamp()} 🔍 Client called tool: searchMatters with terms '${searchTerms}'`);
 
-    // Use Fuse.js for fuzzy search
-    const searchResults = fuse.search(searchTerms);
-    
-    if (searchResults.length === 0) {
-      console.log(`${timestamp()} ⚠️  No resources found for client search: "${searchTerms}"`);
+    const records = await loadMatterSummary(searchTerms, limit);
+
+    if (records.length === 0) {
+      console.log(`${timestamp()} ⚠️  No matters found for client search: "${searchTerms}"`);
       return {
         content: [
           {
             type: "text",
-            text: `No resources found matching: "${searchTerms}". Try keywords like 'butterfly', 'panda', 'photo', 'overview', or 'data'.`,
+            text: `No matters found matching: "${searchTerms}". Try a different matter name keyword.`,
           },
         ],
       };
     }
 
-    // Return top 5 results
-    const results = searchResults.slice(0, 5).map(result => result.item);
-    console.log(`${timestamp()} ✅ Returning ${results.length} matching resources to client`);
+    console.log(`${timestamp()} ✅ Returning ${records.length} matching matters to client`);
 
     const content: any[] = [
       {
         type: "text",
-        text: `Found ${results.length} resource(s) matching "${searchTerms}":\n\n${results.map((r, i) => `${i + 1}. ${r.name}`).join('\n')}`,
+        text: `Found ${records.length} matter(s) matching "${searchTerms}":\n\n${records
+          .map((record, index) => `${index + 1}. ${record.Name_En_US ?? 'Unnamed Matter'} (Client ${record.ClientId}, Matter ${record.Id})`)
+          .join('\n')}`,
       },
     ];
 
-    // Add resource references
-    results.forEach(resource => {
+    records.forEach((record) => {
       content.push({
         type: "resource_link",
-        uri: resource.uri,
-        name: resource.name,
-        description: resource.description,
-        mimeType: resource.mimeType,
+        uri: buildMatterUri(record.ClientId, record.Id),
+        name: record.Name_En_US ?? `Matter ${record.ClientId}/${record.Id}`,
+        description: record.Status
+          ? `Status: ${record.Status}`
+          : "Matter record",
+        mimeType: "application/json",
         annotations: {
           audience: ["assistant"],
           priority: 0.8
@@ -122,19 +182,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return { content };
   }
 
-  if (name === "listSpecies") {
-    console.log(`${timestamp()} 📋 Client called tool: listSpecies`);
+  if (name === "getMatterById") {
+    const validatedArgs = GetMatterByIdSchema.parse(args);
+    const { clientId, id } = validatedArgs;
 
-    // Get only species names
-    const speciesNames = SPECIES_DATA.map(species => species.commonName);
+    console.log(`${timestamp()} 📌 Client called tool: getMatterById for ${clientId}/${id}`);
 
-    console.log(`${timestamp()} ✅ Returning ${speciesNames.length} species names to client`);
+    const record = await loadMatterById(clientId, id);
+
+    if (!record) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No matter found for ClientId ${clientId} and Id ${id}.`,
+          },
+        ],
+      };
+    }
 
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(speciesNames, null, 2),
+          text: JSON.stringify(record, null, 2),
         },
       ],
     };
@@ -145,15 +216,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Handler: List resources
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  console.log(`${timestamp()} 📋 Client requesting list of all ${RESOURCES.length} resources`);
-  
+  console.log(`${timestamp()} 📋 Client requested resource list; returning empty list for database-backed resources.`);
+
   return {
-    resources: RESOURCES.map(r => ({
-      uri: r.uri,
-      name: r.name,
-      description: r.description,
-      mimeType: r.mimeType,
-    }))
+    resources: []
   };
 });
 
@@ -163,52 +229,26 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
   console.log(`${timestamp()} 📖 Client reading resource: ${uri}`);
 
-  // Find the resource
-  const resource = RESOURCES.find(r => r.uri === uri);
-  
-  if (!resource) {
+  const parsed = parseMatterUri(uri);
+  if (!parsed) {
     throw new Error(`Unknown resource: ${uri}`);
   }
 
-  const species = SPECIES_DATA.find(s => s.id === resource.speciesId);
-  
-  if (!species) {
-    throw new Error(`Species not found for resource: ${uri}`);
+  const record = await loadMatterById(parsed.clientId, parsed.id);
+
+  if (!record) {
+    throw new Error(`Matter not found for resource: ${uri}`);
   }
 
-  console.log(`${timestamp()} 📄 Client requested: ${species.commonName} - ${resource.resourceType}`);
-
-  // Return content based on resource type
-  if (resource.resourceType === 'text') {
-    const content = formatSpeciesText(species);
-    console.log(`${timestamp()} 📝 Returning text content to client (${content.length} characters)`);
-    
-    return {
-      contents: [
-        {
-          uri,
-          mimeType: "text/plain",
-          text: content,
-        },
-      ],
-    };
-  }
-
-  if (resource.resourceType === 'image') {
-    console.log(`${timestamp()} 🖼️  Returning image to client for ${species.commonName}`);
-    
-    return {
-      contents: [
-        {
-          uri,
-          mimeType: "image/png",
-          blob: species.image,
-        },
-      ],
-    };
-  }
-
-  throw new Error(`Unknown resource type: ${resource.resourceType}`);
+  return {
+    contents: [
+      {
+        uri,
+        mimeType: "application/json",
+        text: JSON.stringify(record, null, 2),
+      },
+    ],
+  };
 });
 
 // Handler: Subscribe to resource updates
@@ -257,8 +297,8 @@ app.post('/mcp', async (req: Request, res: Response) => {
 
 const PORT = parseInt(process.env.PORT || '3000');
 app.listen(PORT, () => {
-  console.log(`${timestamp()} 🚀 Species MCP Server running on http://localhost:${PORT}/mcp`);
-  console.log(`${timestamp()} 📚 Loaded ${SPECIES_DATA.length} species and ${RESOURCES.length} resources`);
+  console.log(`${timestamp()} 🚀 Matter MCP Server running on http://localhost:${PORT}/mcp`);
+  console.log(`${timestamp()} 📚 Connected to imanage.Matter in the staging-area database`);
 }).on('error', error => {
   console.error(`${timestamp()} Server error:`, error);
   process.exit(1);
