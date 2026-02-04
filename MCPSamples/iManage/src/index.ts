@@ -124,7 +124,6 @@ async function imanageAuthToken(): Promise<string | null> {
 
 async function imanageCustomerId(token: string): Promise<string | null> {
   const url = `https://${IMANAGE_SERVER}/api`;
-  console.log("Fetching iManage customer ID from", url);
   const response = await fetchWithTimeout(
     url,
     {
@@ -163,7 +162,6 @@ function parseIManageUri(uri: string): { customerId: string; libraryId: string; 
 }
 
 async function imanageSearch(query: string, maxResults: number) {
-  console.log("Searching iManage for query:", query);
   const token = await imanageAuthToken();
   if (!token) {
     return [];
