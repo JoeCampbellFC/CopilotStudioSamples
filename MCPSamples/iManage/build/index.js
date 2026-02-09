@@ -1,37 +1,30 @@
+/**
+ * iManage MCP Server (Copilot Studio friendly)
+ * - Tool: search
+ * - Resources: read (for document text / RAG context)
+ * - Clickable citations: resource_link.uri is HTTPS (iwl) with ?mcpKey=<opaqueKey>
+ * - Opaque key -> real iManage URI stored in in-memory lookup with TTL
+ *
+ * Notes:
+ * - No "fetch" tool (Copilot tends to send its own GUIDs)
+ * - resource_link.mimeType is text/plain to reduce PDF grounding behaviours
+ * - resources/read accepts both:
+ *    - https://... ?mcpKey=<key>
+ *    - imanage://<key>  (fallback, if you ever emit that scheme)
+ */
 import express from "express";
 import { Agent } from "undici";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { CallToolRequestSchema, ListToolsRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema, ReadResourceRequestSchema, ListResourcesRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
 import pdfParse from "pdf-parse";
+import crypto from "crypto";
 const app = express();
 app.use(express.json());
-const server = new Server({ name: "imanage-mcp-server", version: "1.0.0" }, { capabilities: { tools: {} } });
-// -------------------- Schemas --------------------
-const SearchSchema = z.object({
-    query: z.string().describe("Search query text"),
-    maxResults: z.number().int().min(1).max(20).optional(),
-});
-const FetchSchema = z.object({
-    id: z.string().describe("iManage document URI or URL"),
-    timeoutSeconds: z.number().positive().optional(),
-    followRedirects: z.boolean().optional(),
-    headers: z.record(z.string()).optional(),
-});
-// ✅ New analytics tool schemas
-const AnalyticsSchema = z.object({
-    ids: z.array(z.string()).min(1).max(50).describe("iManage document URIs"),
-    granularity: z.enum(["daily", "weekly", "monthly"]).optional(),
-});
-const AnalyticsResultSchema = z.object({
-    results: z.record(z.object({
-        views: z.number().nullable(),
-    })),
-});
+const server = new Server({ name: "imanage-mcp-server", version: "1.0.0" }, { capabilities: { resources: { subscribe: true }, tools: {} } });
 // -------------------- Config --------------------
-// ✅ Use env vars (do not hardcode creds in source)
 const IMANAGE_SERVER = process.env.IMANAGE_SERVER ?? "fireman.cloudimanage.com";
 const IMANAGE_USERNAME = process.env.IMANAGE_USERNAME ?? "CloudAdmin@sandbox.firemanco.com";
 const IMANAGE_PASSWORD = process.env.IMANAGE_PASSWORD ?? "pxg@zkm.CVU*der3tbd";
@@ -39,15 +32,68 @@ const IMANAGE_CLIENT_ID = process.env.IMANAGE_CLIENT_ID ?? "d8e2d5ef-0c1f-4475-a
 const IMANAGE_CLIENT_SECRET = process.env.IMANAGE_CLIENT_SECRET ?? "3f8fa1e6-358d-4d11-9bae-8711c2a70a47";
 const IMANAGE_LIBRARY_ID = process.env.IMANAGE_LIBRARY_ID ?? "ACTIVE_2";
 const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT ?? "30");
+const DEFAULT_TIMEOUT_MS = REQUEST_TIMEOUT * 1000;
 const MAX_DOC_BYTES = Number(process.env.MAX_DOC_BYTES ?? String(10 * 1024 * 1024));
 const MAX_PAGES = Number(process.env.MAX_PAGES ?? "20");
 const SKIP_LARGE_FILES = (process.env.SKIP_LARGE_FILES ?? "1") === "1";
 const CHUNK_SIZE = Number(process.env.CHUNK_SIZE ?? "1200");
 const CHUNK_OVERLAP = Number(process.env.CHUNK_OVERLAP ?? "100");
+// If you run behind corp proxy / self-signed TLS, this keeps local dev happy.
+// Consider removing for production.
 const insecureAgent = new Agent({
     connect: { rejectUnauthorized: false },
 });
-const DEFAULT_TIMEOUT_MS = REQUEST_TIMEOUT * 1000;
+const RESOURCE_LOOKUP = new Map();
+const LOOKUP_TTL_MS = 30 * 60 * 1000; // 30 minutes
+function putLookup(entry) {
+    const key = crypto.randomUUID();
+    RESOURCE_LOOKUP.set(key, { ...entry, createdAt: Date.now() });
+    return key;
+}
+function getLookup(key) {
+    const entry = RESOURCE_LOOKUP.get(key);
+    if (!entry)
+        return null;
+    if (Date.now() - entry.createdAt > LOOKUP_TTL_MS) {
+        RESOURCE_LOOKUP.delete(key);
+        return null;
+    }
+    return entry;
+}
+function cleanupLookup() {
+    const now = Date.now();
+    for (const [k, v] of RESOURCE_LOOKUP.entries()) {
+        if (now - v.createdAt > LOOKUP_TTL_MS)
+            RESOURCE_LOOKUP.delete(k);
+    }
+}
+// Do a light cleanup occasionally (non-blocking)
+let _cleanupCounter = 0;
+function maybeCleanup() {
+    _cleanupCounter += 1;
+    if (_cleanupCounter % 25 === 0)
+        cleanupLookup();
+}
+// -------------------- Schemas (Copilot Studio safe) --------------------
+const SearchSchema = z.object({
+    query: z.string().describe("Search query text"),
+    client: z.string().describe("Filter by client number e.g. 12345").optional(),
+    matter: z.string().describe("Filter by matter number e.g. 56789").optional(),
+    maxResults: z.number().int().min(1).max(20).optional(),
+});
+// ✅ Copilot Studio hardening: remove $schema keys
+function stripDollarSchema(schema) {
+    if (schema && typeof schema === "object") {
+        // @ts-ignore
+        if ("$schema" in schema)
+            delete schema["$schema"];
+        for (const v of Object.values(schema)) {
+            if (v && typeof v === "object")
+                stripDollarSchema(v);
+        }
+    }
+    return schema;
+}
 // -------------------- Helpers --------------------
 function splitText(text, chunkSize, overlap) {
     if (!text)
@@ -75,6 +121,34 @@ async function fetchWithTimeout(url, options, timeoutMs) {
     }
     finally {
         clearTimeout(timeout);
+    }
+}
+function appendQueryParam(url, key, value) {
+    // Handles querystring + fragments safely
+    try {
+        const u = new URL(url);
+        u.searchParams.set(key, value);
+        return u.toString();
+    }
+    catch {
+        // Fallback: naive
+        const sep = url.includes("?") ? "&" : "?";
+        return `${url}${sep}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+    }
+}
+function extractMcpKeyFromUri(uri) {
+    // Accept:
+    // - https://... ?mcpKey=<key>
+    // - imanage://<key>
+    if (uri.startsWith("imanage://")) {
+        return uri.slice("imanage://".length).split("?")[0];
+    }
+    try {
+        const u = new URL(uri);
+        return u.searchParams.get("mcpKey");
+    }
+    catch {
+        return null;
     }
 }
 // -------------------- iManage Auth --------------------
@@ -119,8 +193,8 @@ function parseIManageUri(uri) {
     const [customerId, libraryId, docId] = parts;
     return { customerId, libraryId, docId };
 }
-// -------------------- Search (links only) --------------------
-async function imanageSearch(query, maxResults) {
+// -------------------- Search (iManage Work API) --------------------
+async function imanageSearch(query, client, matter, maxResults) {
     const token = await imanageAuthToken();
     if (!token)
         return [];
@@ -128,9 +202,20 @@ async function imanageSearch(query, maxResults) {
     if (!customerId)
         return [];
     const url = `https://${IMANAGE_SERVER}/work/api/v2/customers/${customerId}/libraries/${IMANAGE_LIBRARY_ID}/documents/search`;
+    // Build filters dynamically so we only include custom1/custom2 when provided
+    const filters = {
+        body: query,
+        type: "ACROBAT",
+    };
+    const clientVal = (client ?? "").trim();
+    if (clientVal)
+        filters.custom1 = clientVal;
+    const matterVal = (matter ?? "").trim();
+    if (matterVal)
+        filters.custom2 = matterVal;
     const payload = {
         profile_fields: { document: ["id", "name", "file_edit_date", "iwl"] },
-        filters: { body: query, type: "ACROBAT" },
+        filters,
         limit: maxResults,
     };
     const response = await fetchWithTimeout(url, {
@@ -149,39 +234,14 @@ async function imanageSearch(query, maxResults) {
         const iwl = String(entry.iwl ?? "");
         return [
             {
-                id: imanageDocUri(customerId, IMANAGE_LIBRARY_ID, docId),
+                imanageUri: imanageDocUri(customerId, IMANAGE_LIBRARY_ID, docId),
                 title,
-                url: iwl,
+                iwl,
             },
         ];
     });
 }
-// -------------------- Analytics (views) --------------------
-async function imanageHistoryViews(token, customerId, libraryId, docId, granularity = "weekly") {
-    const url = `https://${IMANAGE_SERVER}/work/api/v2/customers/${customerId}/libraries/${libraryId}/documents/${docId}/history/plot-points/${granularity}`;
-    const response = await fetchWithTimeout(url, {
-        method: "GET",
-        headers: { "X-Auth-Token": token, Accept: "application/json" },
-    }, DEFAULT_TIMEOUT_MS);
-    if (response.status === 204 || response.status === 404)
-        return null;
-    if (!response.ok)
-        return null;
-    const payload = (await response.json());
-    const points = Array.isArray(payload) ? payload : payload.data;
-    if (!Array.isArray(points))
-        return null;
-    let total = 0;
-    for (const point of points) {
-        if (typeof point === "object" && point && "y" in point) {
-            const value = Number(point.y);
-            if (!Number.isNaN(value))
-                total += value;
-        }
-    }
-    return total;
-}
-// -------------------- Fetch (download + parse PDF + include views) --------------------
+// -------------------- Download + parse PDF --------------------
 async function readStreamToBuffer(stream, maxBytes) {
     const reader = stream.getReader();
     const chunks = [];
@@ -207,20 +267,14 @@ async function imanageDownloadPdf(token, customerId, libraryId, docId) {
             if (sizeValue && sizeValue > MAX_DOC_BYTES) {
                 return {
                     bytes: Buffer.from(""),
-                    metadata: {
-                        skipped: true,
-                        reason: `file too large (${sizeValue} > ${MAX_DOC_BYTES} bytes)`,
-                    },
+                    metadata: { skipped: true, reason: `file too large (${sizeValue} > ${MAX_DOC_BYTES} bytes)` },
                 };
             }
         }
     }
     const response = await fetchWithTimeout(url, { method: "GET", headers }, DEFAULT_TIMEOUT_MS);
     if (!response.ok || !response.body) {
-        return {
-            bytes: Buffer.from(""),
-            metadata: { error: `download failed: ${response.status}` },
-        };
+        return { bytes: Buffer.from(""), metadata: { error: `download failed: ${response.status}` } };
     }
     const { buffer, bytes } = await readStreamToBuffer(response.body, MAX_DOC_BYTES);
     return { bytes: buffer, metadata: { bytes } };
@@ -243,7 +297,6 @@ async function resolveIManageDocument(imanageUri) {
     const download = await imanageDownloadPdf(token, customerId, libraryId, docId);
     const text = await extractPdfText(download.bytes);
     const profileUrl = `https://${IMANAGE_SERVER}/work/#/document/${customerId}/${libraryId}/${docId}`;
-    const views = await imanageHistoryViews(token, customerId, libraryId, docId, "weekly");
     const meta = {
         source: "imanage",
         customer_id: customerId,
@@ -252,8 +305,6 @@ async function resolveIManageDocument(imanageUri) {
         url: profileUrl,
         ...download.metadata,
     };
-    if (views !== null)
-        meta.views = views;
     const skipped = download.metadata.skipped === true;
     const reason = typeof download.metadata.reason === "string" ? download.metadata.reason : "";
     return {
@@ -264,134 +315,342 @@ async function resolveIManageDocument(imanageUri) {
         meta,
     };
 }
-async function fetchUrlContent(url, timeoutSeconds, followRedirects, headers) {
-    const response = await fetchWithTimeout(url, {
-        method: "GET",
-        headers: {
-            "User-Agent": "mcp-imanage/1.0",
-            ...(headers ?? {}),
-        },
-        redirect: followRedirects ? "follow" : "manual",
-    }, timeoutSeconds * 1000);
-    if (!response.ok)
-        throw new Error(`URL fetch failed: ${response.status}`);
-    const contentType = response.headers.get("Content-Type") ?? "";
-    const text = await response.text();
-    return {
-        id: url,
-        title: url,
-        text: contentType.includes("text/html") ? text.replace(/<[^>]+>/g, " ") : text,
-        url,
-        meta: {
-            source: "url",
-            content_type: contentType,
-        },
+const DEFAULT_STOPWORDS = new Set([
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "he", "her", "his",
+    "i", "in", "is", "it", "its", "of", "on", "or", "our", "she", "that", "the", "their", "them", "they",
+    "this", "to", "was", "we", "were", "will", "with", "you", "your"
+]);
+const SYNONYMS = {
+    terminate: ["termination", "end", "cease"],
+    termination: ["terminate", "end", "cease"],
+    purchase: ["buy", "acquire", "procure"],
+    price: ["amount", "consideration", "fee", "cost"],
+    notice: ["notify", "notification"],
+    agreement: ["contract"],
+    party: ["parties", "counterparty"],
+    acquired: ["sold", "M&A"],
+};
+function normalise(s) {
+    return s
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+function escapeRegExp(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function tokenize(text, minLen, useSynonyms) {
+    const base = normalise(text)
+        .split(" ")
+        .map((t) => t.trim())
+        .filter((t) => t.length >= minLen)
+        .filter((t) => !DEFAULT_STOPWORDS.has(t));
+    if (!useSynonyms)
+        return base;
+    const out = [];
+    const seen = new Set();
+    for (const t of base) {
+        if (!seen.has(t)) {
+            seen.add(t);
+            out.push(t);
+        }
+        const syns = SYNONYMS[t];
+        if (syns) {
+            for (const s of syns) {
+                const ss = normalise(s);
+                if (ss.length >= minLen && !DEFAULT_STOPWORDS.has(ss) && !seen.has(ss)) {
+                    seen.add(ss);
+                    out.push(ss);
+                }
+            }
+        }
+    }
+    return out;
+}
+function splitSentences(text) {
+    const cleaned = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+    if (!cleaned)
+        return [];
+    return cleaned
+        .split(/(?<=[.!?]["')\]]*)\s+|\n+/g)
+        .map((s) => s.trim())
+        .filter(Boolean);
+}
+function splitParagraphs(text) {
+    const cleaned = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+    if (!cleaned)
+        return [];
+    return cleaned
+        .split(/\n{2,}/g)
+        .map((p) => p.trim())
+        .filter(Boolean);
+}
+function autoChunk(text, maxChars) {
+    const paras = splitParagraphs(text);
+    const chunks = [];
+    for (const p of paras.length ? paras : [text]) {
+        if (p.length <= maxChars) {
+            chunks.push(p);
+            continue;
+        }
+        const sents = splitSentences(p);
+        let buf = "";
+        for (const s of sents) {
+            if (!buf) {
+                buf = s;
+                continue;
+            }
+            if ((buf + " " + s).length <= maxChars) {
+                buf = buf + " " + s;
+            }
+            else {
+                chunks.push(buf);
+                buf = s;
+            }
+        }
+        if (buf)
+            chunks.push(buf);
+    }
+    return chunks.map((c) => c.trim()).filter(Boolean);
+}
+function buildCharNgrams(s, sizes) {
+    const t = normalise(s).replace(/\s+/g, " ");
+    const grams = [];
+    for (const n of sizes) {
+        if (n <= 1)
+            continue;
+        const compact = t.replace(/ /g, "_");
+        for (let i = 0; i + n <= compact.length; i++) {
+            grams.push(`~${compact.slice(i, i + n)}`);
+        }
+    }
+    return grams;
+}
+function addToVec(vec, key, val) {
+    vec.set(key, (vec.get(key) ?? 0) + val);
+}
+function cosineSimilarity(a, b) {
+    const [small, big] = a.size <= b.size ? [a, b] : [b, a];
+    let dot = 0;
+    for (const [k, v] of small) {
+        const bv = big.get(k);
+        if (bv)
+            dot += v * bv;
+    }
+    let na = 0;
+    for (const v of a.values())
+        na += v * v;
+    let nb = 0;
+    for (const v of b.values())
+        nb += v * v;
+    if (na === 0 || nb === 0)
+        return 0;
+    return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+function makeTfidfVectors(query, chunks, minLen, useCharNgrams, charNgramSizes, useSynonyms) {
+    const qTerms = tokenize(query, minLen, useSynonyms);
+    const df = new Map();
+    const chunkFeatures = [];
+    for (const chunk of chunks) {
+        const terms = tokenize(chunk, minLen, useSynonyms);
+        const feats = useCharNgrams ? terms.concat(buildCharNgrams(chunk, charNgramSizes)) : terms;
+        const uniq = new Set(feats);
+        for (const f of uniq)
+            df.set(f, (df.get(f) ?? 0) + 1);
+        chunkFeatures.push(feats);
+    }
+    const qFeats = useCharNgrams ? qTerms.concat(buildCharNgrams(query, charNgramSizes)) : qTerms;
+    const N = Math.max(1, chunks.length);
+    const idf = (f) => {
+        const d = df.get(f) ?? 0;
+        return Math.log(1 + N / (1 + d));
     };
+    const qVec = new Map();
+    {
+        const tf = new Map();
+        for (const f of qFeats)
+            tf.set(f, (tf.get(f) ?? 0) + 1);
+        for (const [f, c] of tf)
+            addToVec(qVec, f, c * idf(f));
+    }
+    const cVecs = chunkFeatures.map((feats) => {
+        const vec = new Map();
+        const tf = new Map();
+        for (const f of feats)
+            tf.set(f, (tf.get(f) ?? 0) + 1);
+        for (const [f, c] of tf)
+            addToVec(vec, f, c * idf(f));
+        return vec;
+    });
+    return { qVec, cVecs, queryTerms: qTerms };
+}
+function lexicalBoost(chunk, query, queryTerms) {
+    const sNorm = normalise(chunk);
+    const qNorm = normalise(query);
+    let overlap = 0;
+    const matched = [];
+    for (const t of queryTerms) {
+        const re = new RegExp(`\\b${escapeRegExp(t)}\\b`, "i");
+        if (re.test(chunk) || sNorm.includes(t)) {
+            overlap += 1;
+            matched.push(t);
+        }
+    }
+    const phrase = qNorm.length >= 3 && sNorm.includes(qNorm) ? 1 : 0;
+    const boost = Math.min(3, overlap) * 0.25 + phrase * 0.35;
+    return { boost, matchTerms: matched };
+}
+export function findRelevantSentences(query, text, opts = {}) {
+    const { topN = 5, minScore = 0.15, includeContext = false, contextWindow = 1, minTermLength = 3, chunking = "sentence", autoChunkMaxChars = 900, useCharNgrams = true, charNgramSizes = [3, 4, 5], cosineWeight = 1.0, lexicalBoostWeight = 0.35, phraseBoost = 0.4, useSynonyms = false, } = opts;
+    const chunks = chunking === "paragraph"
+        ? splitParagraphs(text)
+        : chunking === "auto"
+            ? autoChunk(text, autoChunkMaxChars)
+            : splitSentences(text);
+    if (!chunks.length)
+        return [];
+    const { qVec, cVecs, queryTerms } = makeTfidfVectors(query, chunks, minTermLength, useCharNgrams, charNgramSizes, useSynonyms);
+    const scored = chunks
+        .map((chunk, idx) => {
+        const cos = cosineSimilarity(qVec, cVecs[idx]);
+        const { boost, matchTerms } = lexicalBoost(chunk, query, queryTerms);
+        const sNorm = normalise(chunk);
+        const qNorm = normalise(query);
+        const extraPhrase = qNorm.length >= 3 && sNorm.includes(qNorm) ? phraseBoost : 0;
+        const score = cos * cosineWeight + boost * lexicalBoostWeight + extraPhrase;
+        return { idx, chunk, score, matchTerms };
+    })
+        .filter((x) => x.score >= minScore)
+        .sort((a, b) => b.score - a.score || a.idx - b.idx);
+    const top = scored.slice(0, topN);
+    if (!includeContext) {
+        return top.map(({ chunk, score, matchTerms }) => ({ sentence: chunk, score, matchTerms }));
+    }
+    const picked = new Map();
+    for (const item of top) {
+        for (let i = item.idx - contextWindow; i <= item.idx + contextWindow; i++) {
+            if (i < 0 || i >= chunks.length)
+                continue;
+            if (!picked.has(i)) {
+                const isMain = i === item.idx;
+                picked.set(i, {
+                    sentence: chunks[i],
+                    score: isMain ? item.score : Math.max(0.05, item.score * 0.35),
+                    matchTerms: isMain ? item.matchTerms : [],
+                });
+            }
+        }
+    }
+    return [...picked.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, v]) => v);
+}
+export function buildRagContext(query, text, opts = {}, separator = "\n\n") {
+    const sentences = findRelevantSentences(query, text, opts);
+    const context = sentences.map((s) => s.sentence.trim()).filter(Boolean).join(separator);
+    return { context, sentences };
 }
 // -------------------- MCP handlers --------------------
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+server.setRequestHandler(ListResourcesRequestSchema, async () => {
+    return { resources: [] };
+});
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const uri = request.params.uri;
+    console.log(`📖 resources/read => ${uri}`);
+    const key = extractMcpKeyFromUri(uri);
+    if (!key) {
+        throw new Error(`Unknown resource: ${uri}`);
+    }
+    const entry = getLookup(key);
+    if (!entry) {
+        throw new Error(`Unknown or expired resource id: ${key}. Please run search again (cache TTL ${LOOKUP_TTL_MS / 60000} mins).`);
+    }
+    console.log(`Resolving iManage document for key ${key} => ${entry.imanageUri}`);
+    console.log(`Original query: ${entry.query}`);
+    const doc = await resolveIManageDocument(entry.imanageUri);
+    const { context } = buildRagContext(entry.query ?? "", doc.text, {
+        chunking: "paragraph",
+        topN: 3,
+        includeContext: true,
+        useCharNgrams: true,
+        useSynonyms: true,
+    });
+    // Friendly "Sources" block: keep it human readable.
+    // Clickable target: use the stored IWL if present, else fallback to doc.url.
+    const sourceTitle = entry.title ?? doc.title ?? "iManage document";
+    const clickable = entry.iwl || doc.url || entry.imanageUri;
+    const sourcesBlock = `\n\nSources\n` +
+        `- [${sourceTitle}](${clickable})\n`;
+    console.log(`Built context for ${uri} with sources:\n${sourcesBlock}`);
     return {
-        tools: [
+        contents: [
             {
-                name: "search",
-                description: "Search iManage documents by query (returns resource links only).",
-                inputSchema: zodToJsonSchema(SearchSchema),
-            },
-            {
-                name: "fetch",
-                description: "Fetch an iManage document by URI or fetch URL content (returns text, extras in _meta).",
-                inputSchema: zodToJsonSchema(FetchSchema),
-            },
-            {
-                name: "analytics",
-                description: "Get document analytics (views) for one or more iManage URIs. Returns structuredContent.",
-                inputSchema: zodToJsonSchema(AnalyticsSchema),
-                outputSchema: zodToJsonSchema(AnalyticsResultSchema),
+                uri,
+                mimeType: "text/plain",
+                text: context + sourcesBlock,
             },
         ],
     };
 });
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const schemaOpts = { $refStrategy: "none" };
+    const searchSchema = stripDollarSchema(zodToJsonSchema(SearchSchema, schemaOpts));
+    const resp = {
+        tools: [
+            {
+                name: "search",
+                description: "Search and filter iManage documents by query.",
+                inputSchema: searchSchema,
+            },
+        ],
+    };
+    console.log("TOOLS/LIST =>", JSON.stringify(resp, null, 2));
+    return resp;
+});
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    if (name === "search") {
-        const { query, maxResults } = SearchSchema.parse(args);
-        console.debug(`🔎 [debug] search tool called`, { query, maxResults });
-        if (!query.trim())
-            return { content: [] };
-        const results = await imanageSearch(query, maxResults ?? 5);
-        return {
-            content: results.map((r) => ({
-                type: "resource_link",
-                name: r.title,
-                uri: r.id,
-                mimeType: "application/pdf",
-                annotations: { audience: ["assistant"], priority: 0.8 },
-                // Keep a hint URL (no text, no views in search)
-                _meta: { url: r.url },
-            })),
-        };
+    if (name !== "search") {
+        throw new Error(`Unknown tool: ${name}`);
     }
-    if (name === "analytics") {
-        const { ids, granularity } = AnalyticsSchema.parse(args);
-        const g = granularity ?? "weekly";
-        const token = await imanageAuthToken();
-        if (!token) {
-            const structuredContent = { results: {} };
-            return {
-                content: [{ type: "text", text: JSON.stringify(structuredContent, null, 2) }],
-                structuredContent,
-            };
-        }
-        const results = {};
-        await Promise.all(ids.map(async (uri) => {
-            try {
-                const { customerId, libraryId, docId } = parseIManageUri(uri);
-                const views = await imanageHistoryViews(token, customerId, libraryId, docId, g);
-                results[uri] = { views };
-            }
-            catch {
-                results[uri] = { views: null };
-            }
-        }));
-        const structuredContent = { results };
-        return {
-            content: [{ type: "text", text: JSON.stringify(structuredContent, null, 2) }],
-            structuredContent,
-        };
+    const { query, maxResults, client, matter } = SearchSchema.parse(args);
+    const q = query.trim();
+    if (!q)
+        return { content: [] };
+    maybeCleanup();
+    const results = await imanageSearch(q, client, matter, maxResults ?? 3);
+    const content = [
+        {
+            type: "text",
+            text: results.length === 0 ? `No results for "${q}".` : `Found ${results.length} document(s) for "${q}":`,
+        },
+    ];
+    for (const r of results) {
+        // Store mapping: opaque key -> real iManage URI (+ friendly title + iwl)
+        const key = putLookup({
+            imanageUri: r.imanageUri,
+            query: q,
+            title: r.title,
+            iwl: r.iwl || undefined,
+        });
+        // Clickable citations: prefer HTTPS uri (iwl) with ?mcpKey=<key>
+        // Copilot will cite this "source", and the user can click it.
+        const baseClickable = r.iwl && r.iwl.startsWith("http") ? r.iwl : `https://${IMANAGE_SERVER}/work/`;
+        const clickableWithKey = appendQueryParam(baseClickable, "mcpKey", key);
+        content.push({
+            type: "resource_link",
+            uri: clickableWithKey,
+            name: r.title,
+            mimeType: "text/plain",
+            annotations: { audience: ["user"], priority: 0.8 },
+            _meta: {
+                mcpKey: key,
+                imanageUri: r.imanageUri,
+                iwl: r.iwl,
+            },
+        });
     }
-    if (name === "fetch") {
-        const { id, timeoutSeconds, followRedirects, headers } = FetchSchema.parse(args);
-        console.debug(`📥 [debug] fetch tool called`, { id, timeoutSeconds, followRedirects });
-        const timeout = timeoutSeconds ?? 15;
-        const redirects = followRedirects ?? true;
-        let isUrl = false;
-        try {
-            const u = new URL(id);
-            isUrl = u.protocol === "http:" || u.protocol === "https:";
-        }
-        catch {
-            isUrl = false;
-        }
-        const doc = isUrl
-            ? await fetchUrlContent(id, timeout, redirects, headers)
-            : await resolveIManageDocument(id);
-        // ✅ Spec-friendly: put extras in _meta (many clients drop unknown fields like "metadata")
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: doc.text,
-                    _meta: {
-                        id: doc.id,
-                        title: doc.title,
-                        url: doc.url,
-                        ...doc.meta, // includes views when available
-                    },
-                },
-            ],
-        };
-    }
-    throw new Error(`Unknown tool: ${name}`);
+    return { content };
 });
 // -------------------- Express transport --------------------
 app.post("/mcp", async (req, res) => {

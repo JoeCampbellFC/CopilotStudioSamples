@@ -1,39 +1,51 @@
-import sql from 'mssql';
+import sql from "mssql";
 
 const DEFAULT_JDBC =
-  'jdbc:sqlserver://insightplus.database.windows.net:1433;database=staging-area;user={your_username_here};password={your_password_here};encrypt=true;trustServerCertificate=false;hostNameInCertificate=*.database.windows.net;loginTimeout=30;authentication=ActiveDirectoryPassword';
+  "jdbc:sqlserver://insightplus.database.windows.net:1433;database=staging-area;user=mcp_user;password=Password1!;loginTimeout=30"
 
-const JDBC_PREFIX = 'jdbc:sqlserver://';
+const JDBC_PREFIX = "jdbc:sqlserver://";
 
 const parseBoolean = (value?: string): boolean | undefined => {
-  if (value === undefined) {
-    return undefined;
+  if (value === undefined) return undefined;
+  return value.toLowerCase() === "true";
+};
+
+const getParam = (params: Map<string, string>, ...keys: string[]) => {
+  for (const k of keys) {
+    const v = params.get(k.toLowerCase());
+    if (v !== undefined) return v;
   }
-  return value.toLowerCase() === 'true';
+  return undefined;
 };
 
 const parseJdbcConnectionString = (jdbc: string): sql.config => {
   const normalized = jdbc.startsWith(JDBC_PREFIX) ? jdbc.slice(JDBC_PREFIX.length) : jdbc;
-  const [hostPort, ...rest] = normalized.split(';').filter(Boolean);
-  const [server, portString] = hostPort.split(':');
+  const [hostPort, ...rest] = normalized.split(";").filter(Boolean);
+  const [server, portString] = hostPort.split(":");
 
   const params = new Map<string, string>();
-  rest.forEach((segment) => {
-    const [rawKey, ...valueParts] = segment.split('=');
-    if (!rawKey || valueParts.length === 0) {
-      return;
-    }
-    params.set(rawKey.toLowerCase(), valueParts.join('='));
-  });
+  for (const segment of rest) {
+    const [rawKey, ...valueParts] = segment.split("=");
+    if (!rawKey || valueParts.length === 0) continue;
+    params.set(rawKey.toLowerCase(), valueParts.join("="));
+  }
 
-  const database = params.get('database');
-  const user = params.get('user') ?? params.get('userid') ?? params.get('user id');
-  const password = params.get('password');
-  const encrypt = parseBoolean(params.get('encrypt')) ?? true;
+  const database = getParam(params, "database");
+  const user = getParam(params, "user", "userid", "user id");
+  const password = getParam(params, "password");
+
+  const encrypt = parseBoolean(getParam(params, "encrypt")) ?? true;
   const trustServerCertificate =
-    parseBoolean(params.get('trustservercertificate')) ?? false;
-  const hostNameInCertificate = params.get('hostnameincertificate');
-  const authentication = params.get('authentication');
+    parseBoolean(getParam(params, "trustservercertificate")) ?? false;
+
+  const authentication = getParam(params, "authentication");
+
+  // Some JDBC strings include these; @types/mssql wants them for AAD password auth
+  const tenantId =
+    getParam(params, "tenantid", "aadtenantid") ?? process.env.AZURE_TENANT_ID ?? process.env.AAD_TENANT_ID;
+
+  const clientId =
+    getParam(params, "clientid", "aadclientid") ?? process.env.AZURE_CLIENT_ID ?? process.env.AAD_CLIENT_ID;
 
   const config: sql.config = {
     server,
@@ -42,19 +54,24 @@ const parseJdbcConnectionString = (jdbc: string): sql.config => {
     options: {
       encrypt,
       trustServerCertificate,
-      hostNameInCertificate,
+      // NOTE: hostNameInCertificate is not in mssql IOptions types; omit it.
     },
   };
 
-  if (authentication?.toLowerCase() === 'activedirectorypassword') {
+  const authIsAadPassword = authentication?.toLowerCase() === "activedirectorypassword";
+
+  if (authIsAadPassword && user && password && tenantId && clientId) {
     config.authentication = {
-      type: 'azure-active-directory-password',
+      type: "azure-active-directory-password",
       options: {
-        userName: user ?? '',
-        password: password ?? '',
+        userName: user,
+        password,
+        tenantId,
+        clientId,
       },
     };
   } else {
+    // Fallback to SQL auth
     config.user = user;
     config.password = password;
   }
