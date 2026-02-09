@@ -64,7 +64,7 @@ const insecureAgent = new Agent({
 
 // -------------------- Lookup cache (opaque key -> iManage URI) --------------------
 
-type LookupEntry = {
+/*type LookupEntry = {
   imanageUri: string; // real: imanage://customer/library/docId
   query?: string;
   title?: string;
@@ -104,7 +104,7 @@ function maybeCleanup(): void {
   _cleanupCounter += 1;
   if (_cleanupCounter % 25 === 0) cleanupLookup();
 }
-
+*/
 // -------------------- Schemas (Copilot Studio safe) --------------------
 
 const SearchSchema = z.object({
@@ -298,12 +298,15 @@ async function imanageSearch(
 
     const title = String(entry.name ?? docId);
     const iwl = String(entry.iwl ?? "");
-
+    const client = String(entry.custom1 ?? "");
+    const matter = String(entry.custom2 ?? "");
     return [
       {
         imanageUri: imanageDocUri(customerId, IMANAGE_LIBRARY_ID, docId),
         title,
-        iwl,
+        iwl,  
+        client,
+        matter
       },
     ];
   });
@@ -370,7 +373,7 @@ async function extractPdfText(pdfBytes: Buffer): Promise<string> {
   if (text.length > MAX_DOC_BYTES / 4) {
     text = splitText(text, CHUNK_SIZE, CHUNK_OVERLAP);
   }
-  return `[PDF parsed via pdf-parse]\n${text}`;
+  return `${text}`;
 }
 
 async function resolveIManageDocument(imanageUri: string) {
@@ -401,6 +404,25 @@ async function resolveIManageDocument(imanageUri: string) {
     text: text || (skipped ? `[Skipped: ${reason}]` : ""),
     url: profileUrl,
     meta,
+  };
+}
+
+export function splitIManageUri(uri: string): {
+  documentUri: string;
+  query: string | null;
+} {
+  const queryIndex = uri.indexOf("?");
+  if (queryIndex === -1) {
+    return { documentUri: uri, query: null };
+  }
+
+  const documentUri = uri.substring(0, queryIndex);
+  const params = new URLSearchParams(uri.substring(queryIndex + 1));
+  const q = params.get("q");
+
+  return {
+    documentUri,
+    query: q ? decodeURIComponent(q) : null,
   };
 }
 
@@ -743,23 +765,22 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const uri = request.params.uri;
   console.log(`📖 resources/read => ${uri}`);
 
-  const key = extractMcpKeyFromUri(uri);
-  if (!key) {
-    throw new Error(`Unknown resource: ${uri}`);
-  }
 
-  const entry = getLookup(key);
+  /*const entry = getLookup(key);
   if (!entry) {
     throw new Error(
       `Unknown or expired resource id: ${key}. Please run search again (cache TTL ${LOOKUP_TTL_MS / 60000} mins).`
     );
-  }
+  }*/
 
-  console.log(`Resolving iManage document for key ${key} => ${entry.imanageUri}`);
-  console.log(`Original query: ${entry.query}`);
-  const doc = await resolveIManageDocument(entry.imanageUri);
 
-  const { context } = buildRagContext(entry.query ?? "", doc.text, {
+
+  const { documentUri, query } = splitIManageUri(uri);
+  console.log(`Resolving iManage document for key ${documentUri} with query "${query}"...`);
+
+  const doc = await resolveIManageDocument(documentUri);
+
+  const { context } = buildRagContext(query ?? "", doc.text, {
     chunking: "paragraph",
     topN: 3,
     includeContext: true,
@@ -769,14 +790,15 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
   // Friendly "Sources" block: keep it human readable.
   // Clickable target: use the stored IWL if present, else fallback to doc.url.
-  const sourceTitle = entry.title ?? doc.title ?? "iManage document";
-  const clickable = entry.iwl || doc.url || entry.imanageUri;
+  const sourceTitle = doc.title ?? "iManage document";
+  const clickable = doc.url;
   const sourcesBlock =
   `\n\nSources\n` +
   `- [${sourceTitle}](${clickable})\n`;
 
 
-  console.log(`Built context for ${uri} with sources:\n${sourcesBlock}`);
+  //console.log(`Built context for ${uri} with sources:\n${sourcesBlock}`);
+  //console.log(`Context:\n${context}`);
   return {
     contents: [
       {
@@ -817,41 +839,65 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const q = query.trim();
   if (!q) return { content: [] };
 
-  maybeCleanup();
+  //maybeCleanup();
 
-  const results = await imanageSearch(q, client, matter, maxResults ?? 3);
+const results = await imanageSearch(q, client, matter, maxResults ?? 3);
 
-  const content: any[] = [
-    {
-      type: "text",
-      text: results.length === 0 ? `No results for "${q}".` : `Found ${results.length} document(s) for "${q}":`,
-    },
-  ];
+// Build a human-readable list that Copilot will always render
+const lines =
+  results.length === 0
+    ? []
+    : results.map((r, i) => {
+        // Prefer iwl if present; else fall back to a sensible Work URL
+        const href =
+          r.iwl && String(r.iwl).startsWith("http")
+            ? String(r.iwl)
+            : `https://${IMANAGE_SERVER}/work/#/document/${encodeURIComponent(
+                (r as any).customerId ?? "" // if you have it
+              )}/${encodeURIComponent(IMANAGE_LIBRARY_ID)}/${encodeURIComponent(
+                (r as any).docId ?? ""
+              )}`;
 
+        // If you don't have customerId/docId here, just fall back to /work/
+        const safeHref = href.includes("undefined")
+          ? `https://${IMANAGE_SERVER}/work/`
+          : href;
+
+        const title = r.title || r.imanageUri || "Untitled";
+        return `${i + 1}. [${title}](${safeHref})`;
+      });
+
+const content: any[] = [
+  {
+    type: "text",
+    text:
+      results.length === 0
+        ? `No results for "${q}".`
+        : `Found ${results.length} document(s) for "${q}":\n\n${lines.join("\n")}`,
+  },
+];
   for (const r of results) {
     // Store mapping: opaque key -> real iManage URI (+ friendly title + iwl)
-    const key = putLookup({
-      imanageUri: r.imanageUri,
-      query: q,
-      title: r.title,
-      iwl: r.iwl || undefined,
-    });
+
+    const uri = r.imanageUri + "?q=" + encodeURIComponent(q);
+
 
     // Clickable citations: prefer HTTPS uri (iwl) with ?mcpKey=<key>
     // Copilot will cite this "source", and the user can click it.
-    const baseClickable = r.iwl && r.iwl.startsWith("http") ? r.iwl : `https://${IMANAGE_SERVER}/work/`;
-    const clickableWithKey = appendQueryParam(baseClickable, "mcpKey", key);
+    //const baseClickable = r.iwl && r.iwl.startsWith("http") ? r.iwl : `https://${IMANAGE_SERVER}/work/`;
+    //const clickableWithKey = appendQueryParam(baseClickable, "mcpKey", key);
 
     content.push({
       type: "resource_link",
-      uri: clickableWithKey, 
+      uri: uri, 
       name: r.title,         
       mimeType: "text/plain",
       annotations: { audience: ["user"], priority: 0.8 },
       _meta: {
-        mcpKey: key,
         imanageUri: r.imanageUri,
         iwl: r.iwl,
+        matter: r.matter,
+        client: r.client,
       },
     });
   }
