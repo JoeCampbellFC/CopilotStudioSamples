@@ -29,6 +29,11 @@ const SKIP_LARGE_FILES = (process.env.SKIP_LARGE_FILES ?? "1") === "1";
 const CHUNK_SIZE = Number(process.env.CHUNK_SIZE ?? "1200");
 const CHUNK_OVERLAP = Number(process.env.CHUNK_OVERLAP ?? "100");
 
+const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT ?? "";
+const AZURE_OPENAI_API_KEY = process.env.AZURE_OPENAI_API_KEY ?? "";
+const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT ?? "";
+const AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION ?? "2024-06-01";
+
 // If you run behind corp proxy / self-signed TLS, this keeps local dev happy.
 // Consider removing for production.
 const insecureAgent = new Agent({
@@ -42,6 +47,17 @@ export const SearchSchema = z.object({
   client: z.string().describe("Filter by client number e.g. 12345").optional(),
   matter: z.string().describe("Filter by matter number e.g. 56789").optional(),
   maxResults: z.number().int().min(1).max(20).optional(),
+});
+
+export const SummarizeDocumentSchema = z.object({
+  imanageUri: z.string().describe("iManage document URI in format imanage://<customer>/<library>/<docId>"),
+  maxChunkChars: z.number().int().min(500).max(6000).optional().describe("Approximate max chars per chunk"),
+});
+
+export const AskDocumentSchema = z.object({
+  imanageUri: z.string().describe("iManage document URI in format imanage://<customer>/<library>/<docId>"),
+  question: z.string().min(3).describe("Question to ask about the document"),
+  topChunks: z.number().int().min(1).max(12).optional().describe("How many relevant chunks to include"),
 });
 
 // ✅ Copilot Studio hardening: remove $schema keys
@@ -59,6 +75,16 @@ export function stripDollarSchema<T>(schema: T): T {
 export function buildSearchInputSchema() {
   const schemaOpts = { $refStrategy: "none" as any };
   return stripDollarSchema(zodToJsonSchema(SearchSchema, schemaOpts));
+}
+
+export function buildSummarizeDocumentInputSchema() {
+  const schemaOpts = { $refStrategy: "none" as any };
+  return stripDollarSchema(zodToJsonSchema(SummarizeDocumentSchema, schemaOpts));
+}
+
+export function buildAskDocumentInputSchema() {
+  const schemaOpts = { $refStrategy: "none" as any };
+  return stripDollarSchema(zodToJsonSchema(AskDocumentSchema, schemaOpts));
 }
 
 // -------------------- Helpers --------------------
@@ -91,6 +117,52 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: nu
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function ensureAzureOpenAiConfig() {
+  if (!AZURE_OPENAI_ENDPOINT || !AZURE_OPENAI_API_KEY || !AZURE_OPENAI_DEPLOYMENT) {
+    throw new Error(
+      "Missing Azure OpenAI configuration. Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, and AZURE_OPENAI_DEPLOYMENT."
+    );
+  }
+}
+
+async function azureOpenAiChat(messages: Array<{ role: "system" | "user" | "assistant"; content: string }>): Promise<string> {
+  ensureAzureOpenAiConfig();
+
+  const endpoint = AZURE_OPENAI_ENDPOINT.replace(/\/$/, "");
+  const url = `${endpoint}/openai/deployments/${encodeURIComponent(
+    AZURE_OPENAI_DEPLOYMENT
+  )}/chat/completions?api-version=${encodeURIComponent(AZURE_OPENAI_API_VERSION)}`;
+
+  const response = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-key": AZURE_OPENAI_API_KEY,
+      },
+      body: JSON.stringify({
+        messages,
+        temperature: 0.2,
+      }),
+    },
+    DEFAULT_TIMEOUT_MS
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Azure OpenAI request failed: ${response.status} ${body}`);
+  }
+
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+
+  const content = data.choices?.[0]?.message?.content?.trim();
+  if (!content) throw new Error("Azure OpenAI returned an empty response");
+  return content;
 }
 
 export function appendQueryParam(url: string, key: string, value: string): string {
@@ -502,6 +574,93 @@ function autoChunk(text: string, maxChars: number): string[] {
   }
 
   return chunks.map((c) => c.trim()).filter(Boolean);
+}
+
+function chunkTextForLlm(text: string, maxChars: number, overlap: number): string[] {
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  if (!normalized) return [];
+
+  const auto = autoChunk(normalized, maxChars);
+  if (auto.length > 1) return auto;
+
+  const chunks: string[] = [];
+  let start = 0;
+  while (start < normalized.length) {
+    const end = Math.min(normalized.length, start + maxChars);
+    chunks.push(normalized.slice(start, end));
+    start = Math.max(start + maxChars - overlap, start + 1);
+  }
+  return chunks;
+}
+
+export async function summarizeDocumentText(text: string, maxChunkChars = 3000): Promise<string> {
+  const chunks = chunkTextForLlm(text, maxChunkChars, Math.min(300, Math.floor(maxChunkChars / 10)));
+  if (!chunks.length) return "The document has no extractable text to summarize.";
+
+  const chunkSummaries: string[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const summary = await azureOpenAiChat([
+      {
+        role: "system",
+        content:
+          "You are a legal document summarizer. Produce a concise, factual summary using only the provided chunk.",
+      },
+      {
+        role: "user",
+        content: `Summarize chunk ${i + 1}/${chunks.length}. Focus on obligations, dates, parties, risks, and key clauses.\n\n${chunks[i]}`,
+      },
+    ]);
+    chunkSummaries.push(`Chunk ${i + 1}: ${summary}`);
+  }
+
+  if (chunkSummaries.length === 1) return chunkSummaries[0];
+
+  return azureOpenAiChat([
+    {
+      role: "system",
+      content:
+        "You are a legal analyst. Consolidate chunk summaries into a final coherent document summary. Avoid repetition and keep only key facts.",
+    },
+    {
+      role: "user",
+      content: `Create a final summary from these chunk summaries:\n\n${chunkSummaries.join("\n\n")}`,
+    },
+  ]);
+}
+
+export async function answerQuestionFromDocumentText(
+  question: string,
+  text: string,
+  topChunks = 6,
+  chunkSize = 2000
+): Promise<string> {
+  const chunks = chunkTextForLlm(text, chunkSize, Math.min(250, Math.floor(chunkSize / 10)));
+  if (!chunks.length) return "The document has no extractable text, so I cannot answer from it.";
+
+  const relevant = findRelevantSentences(question, chunks.join("\n\n"), {
+    chunking: "auto",
+    autoChunkMaxChars: chunkSize,
+    topN: topChunks,
+    includeContext: false,
+    useCharNgrams: true,
+    useSynonyms: true,
+  });
+
+  const context = (relevant.length ? relevant : chunks.slice(0, topChunks).map((chunk) => ({ sentence: chunk, score: 0, matchTerms: [] })))
+    .map((item, idx) => `[Chunk ${idx + 1}]\n${item.sentence}`)
+    .join("\n\n");
+
+  return azureOpenAiChat([
+    {
+      role: "system",
+      content:
+        "Answer the question only from the supplied context. If unsure, say what is missing. Cite chunk numbers like [Chunk 2].",
+    },
+    {
+      role: "user",
+      content: `Question: ${question}\n\nContext:\n${context}`,
+    },
+  ]);
 }
 
 function buildCharNgrams(s: string, sizes: number[]): string[] {
