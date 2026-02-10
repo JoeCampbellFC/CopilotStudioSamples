@@ -23,14 +23,20 @@ import {
   ListResourcesRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import {
+  answerQuestionFromDocumentText,
+  buildAskDocumentInputSchema,
   buildRagContext,
   buildSearchInputSchema,
+  buildSummarizeDocumentInputSchema,
   IMANAGE_LIBRARY_ID,
   IMANAGE_SERVER,
   imanageSearch,
   resolveIManageDocument,
   SearchSchema,
   splitIManageUri,
+  summarizeDocumentText,
+  SummarizeDocumentSchema,
+  AskDocumentSchema,
 } from "./utils/utils.js";
 
 const app = express();
@@ -89,6 +95,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description: "Search and filter iManage documents by query.",
         inputSchema: buildSearchInputSchema(),
       },
+      {
+        name: "get_document_summary",
+        description: "Get a concise summary of an iManage document using Azure OpenAI.",
+        inputSchema: buildSummarizeDocumentInputSchema(),
+      },
+      {
+        name: "ask_document",
+        description: "Answer a question from an iManage document using Azure OpenAI and chunked retrieval.",
+        inputSchema: buildAskDocumentInputSchema(),
+      },
     ],
   };
 
@@ -98,6 +114,44 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  if (name === "get_document_summary") {
+    const { imanageUri, maxChunkChars } = SummarizeDocumentSchema.parse(args);
+    const doc = await resolveIManageDocument(imanageUri);
+    const summary = await summarizeDocumentText(doc.text, maxChunkChars ?? 3000);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Summary for ${doc.title}:
+
+${summary}
+
+Source: ${doc.url}`,
+        },
+      ],
+    };
+  }
+
+  if (name === "ask_document") {
+    const { imanageUri, question, topChunks } = AskDocumentSchema.parse(args);
+    const doc = await resolveIManageDocument(imanageUri);
+    const answer = await answerQuestionFromDocumentText(question, doc.text, topChunks ?? 6);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Answer from ${doc.title}:
+
+${answer}
+
+Source: ${doc.url}`,
+        },
+      ],
+    };
+  }
 
   if (name !== "search") {
     throw new Error(`Unknown tool: ${name}`);
